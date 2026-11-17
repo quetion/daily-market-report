@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TPE = timezone(timedelta(hours=8))
-SITE_TITLE = os.environ.get("SITE_TITLE", "顏選金融｜每日財經報導")
+SITE_TITLE = os.environ.get("SITE_TITLE", "顏選金融")
 OUT = Path(__file__).resolve().parent / "_site"
 
 
