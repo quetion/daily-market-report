@@ -1,0 +1,44 @@
+name: 發布每日財經報導
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 每天 00:00 UTC = 台北 08:00（GitHub 排程可能晚幾分鐘）
+  workflow_dispatch:       # 手動上線：Actions 頁面按 Run workflow，或本機 ./publish.sh
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install google-auth requests
+      - name: 從 Google Drive 抓 HTML 並組網站
+        env:
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          SITE_TITLE: ${{ vars.SITE_TITLE || '每日財經報導' }}
+        run: python build.py --drive
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
