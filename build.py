@@ -9,10 +9,12 @@
 
 日期判定：檔名開頭 8 碼數字（例如 20261116_台股大跌.html → 2026-11-16）；
 沒有的話用檔案修改時間（台北時間）。同一天有多個檔案時，取最後修改的那個。
+資料夾結構：根目錄放日報；子資料夾「週報」放週報。
 輸出到 _site/：
-  index.html            最新一篇（右下角加「歷史日報」連結）
-  YYYY-MM-DD/index.html 每一天的固定網址
-  archive/index.html    歷史列表
+  index.html                   最新一篇日報（右下角加「歷史日報」連結）
+  YYYY-MM-DD/index.html        每天日報的固定網址
+  weekly/YYYY-MM-DD/index.html 每週週報的固定網址
+  archive/index.html           歷史列表（日報／週報兩區）
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ from pathlib import Path
 
 TPE = timezone(timedelta(hours=8))
 SITE_TITLE = os.environ.get("SITE_TITLE", "顏選金融")
+WEEKLY_DIR = "週報"
 OUT = Path(__file__).resolve().parent / "_site"
 
 
@@ -60,15 +63,17 @@ def date_of(name: str, modified: datetime) -> str:
 
 # ---------- 來源 ----------
 
-def from_local(folder: Path) -> list[Report]:
-    out = []
-    for p in sorted(folder.glob("*.htm*")):
-        mod = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
-        out.append(Report(date_of(p.name, mod), p.name, mod, p.read_bytes()))
-    return out
+def from_local(folder: Path) -> dict[str, list[Report]]:
+    def scan(d: Path) -> list[Report]:
+        out = []
+        for p in sorted(d.glob("*.htm*")) if d.is_dir() else []:
+            mod = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+            out.append(Report(date_of(p.name, mod), p.name, mod, p.read_bytes()))
+        return out
+    return {"daily": scan(folder), "weekly": scan(folder / WEEKLY_DIR)}
 
 
-def from_drive(folder_id: str, sa_json: str) -> list[Report]:
+def from_drive(folder_id: str, sa_json: str) -> dict[str, list[Report]]:
     from google.oauth2 import service_account
     from google.auth.transport.requests import AuthorizedSession
 
@@ -77,37 +82,50 @@ def from_drive(folder_id: str, sa_json: str) -> list[Report]:
         scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
     s = AuthorizedSession(creds)
-    files, token = [], None
-    q = f"'{folder_id}' in parents and trashed = false and mimeType = 'text/html'"
-    while True:
-        r = s.get(
-            "https://www.googleapis.com/drive/v3/files",
-            params={
-                "q": q,
-                "fields": "nextPageToken, files(id, name, modifiedTime)",
-                "pageSize": 1000,
-                "supportsAllDrives": "true",
-                "includeItemsFromAllDrives": "true",
-                **({"pageToken": token} if token else {}),
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        files += data.get("files", [])
-        token = data.get("nextPageToken")
-        if not token:
-            break
 
-    out = []
-    for f in files:
-        mod = datetime.fromisoformat(f["modifiedTime"].replace("Z", "+00:00"))
-        r = s.get(
-            f"https://www.googleapis.com/drive/v3/files/{f['id']}",
-            params={"alt": "media", "supportsAllDrives": "true"},
-        )
-        r.raise_for_status()
-        out.append(Report(date_of(f["name"], mod), f["name"], mod, r.content))
-    return out
+    def children(parent: str) -> list[dict]:
+        files, token = [], None
+        q = (f"'{parent}' in parents and trashed = false and "
+             "(mimeType = 'text/html' or mimeType = 'application/vnd.google-apps.folder')")
+        while True:
+            r = s.get(
+                "https://www.googleapis.com/drive/v3/files",
+                params={
+                    "q": q,
+                    "fields": "nextPageToken, files(id, name, mimeType, modifiedTime)",
+                    "pageSize": 1000,
+                    "supportsAllDrives": "true",
+                    "includeItemsFromAllDrives": "true",
+                    **({"pageToken": token} if token else {}),
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+            files += data.get("files", [])
+            token = data.get("nextPageToken")
+            if not token:
+                return files
+
+    def download(files: list[dict]) -> list[Report]:
+        out = []
+        for f in files:
+            if f["mimeType"] != "text/html":
+                continue
+            mod = datetime.fromisoformat(f["modifiedTime"].replace("Z", "+00:00"))
+            r = s.get(
+                f"https://www.googleapis.com/drive/v3/files/{f['id']}",
+                params={"alt": "media", "supportsAllDrives": "true"},
+            )
+            r.raise_for_status()
+            out.append(Report(date_of(f["name"], mod), f["name"], mod, r.content))
+        return out
+
+    root = children(folder_id)
+    weekly = [f for f in root if f["mimeType"].endswith("folder") and f["name"] == WEEKLY_DIR]
+    return {
+        "daily": download(root),
+        "weekly": download(children(weekly[0]["id"])) if weekly else [],
+    }
 
 
 # ---------- 輸出 ----------
@@ -131,14 +149,22 @@ def with_nav(content: bytes, href: str) -> bytes:
 WEEKDAYS = "一二三四五六日"
 
 
-def archive_page(reports: list[Report]) -> str:
+def rows_html(reports: list[Report], prefix: str) -> str:
     rows = []
     for r in reports:
         d = datetime.strptime(r.date, "%Y-%m-%d")
         rows.append(
-            f'<li><a href="../{r.date}/"><span class="d">{d:%Y/%m/%d}（{WEEKDAYS[d.weekday()]}）</span>'
+            f'<li><a href="../{prefix}{r.date}/"><span class="d">{d:%Y/%m/%d}（{WEEKDAYS[d.weekday()]}）</span>'
             f'<span class="t">{html.escape(r.title)}</span></a></li>'
         )
+    return "<ul>\n" + "\n".join(rows) + "\n</ul>"
+
+
+def archive_page(daily: list[Report], weekly: list[Report]) -> str:
+    sections = ""
+    if weekly:
+        sections += f'<h2>週報 <small>{len(weekly)} 篇</small></h2>\n{rows_html(weekly, "weekly/")}\n'
+    sections += f'<h2>日報 <small>{len(daily)} 篇</small></h2>\n{rows_html(daily, "")}\n'
     updated = datetime.now(TPE).strftime("%Y/%m/%d %H:%M")
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant"><head>
@@ -158,45 +184,54 @@ li a{{display:flex;gap:16px;padding:14px 18px;color:inherit;text-decoration:none
 li a:hover{{background:color-mix(in srgb,var(--accent) 8%,transparent)}}
 .d{{flex:none;color:var(--muted);font-variant-numeric:tabular-nums;font-size:14px}}
 .t{{font-weight:500}}
+h2{{font-size:18px;margin:28px 0 10px}} h2 small{{color:var(--muted);font-weight:400;font-size:13px;margin-left:6px}}
 @media (max-width:520px){{li a{{flex-direction:column;gap:2px}}}}
 </style></head>
 <body><main>
 <h1>{html.escape(SITE_TITLE)}</h1>
-<p class="sub">共 {len(reports)} 篇・更新於 {updated}</p>
-<a class="latest" href="../">→ 看最新一篇</a>
-<ul>
-{chr(10).join(rows)}
-</ul>
+<p class="sub">更新於 {updated}</p>
+<a class="latest" href="../">→ 看最新日報</a>
+{sections}
 </main></body></html>
 """
 
 
-def build(reports: list[Report]) -> None:
-    # 同一天取最後修改的那份
+def latest_per_date(reports: list[Report]) -> list[Report]:
+    """同一天取最後修改的那份，新到舊排序。"""
     by_date: dict[str, Report] = {}
     for r in reports:
         if r.date not in by_date or r.modified > by_date[r.date].modified:
             by_date[r.date] = r
-    reports = sorted(by_date.values(), key=lambda r: r.date, reverse=True)
-    if not reports:
-        sys.exit("資料夾裡沒有 HTML 檔，停止發布（避免把網站清空）。")
+    return sorted(by_date.values(), key=lambda r: r.date, reverse=True)
+
+
+def build(src: dict[str, list[Report]]) -> None:
+    daily, weekly = latest_per_date(src["daily"]), latest_per_date(src["weekly"])
+    if not daily:
+        sys.exit("資料夾裡沒有日報 HTML，停止發布（避免把網站清空）。")
 
     if OUT.exists():
         shutil.rmtree(OUT)
     OUT.mkdir()
     (OUT / ".nojekyll").write_text("")
 
-    for r in reports:
+    for r in daily:
         d = OUT / r.date
         d.mkdir()
         (d / "index.html").write_bytes(with_nav(r.content, "../archive/"))
-    (OUT / "index.html").write_bytes(with_nav(reports[0].content, "archive/"))
+    for r in weekly:
+        d = OUT / "weekly" / r.date
+        d.mkdir(parents=True)
+        (d / "index.html").write_bytes(with_nav(r.content, "../../archive/"))
+    (OUT / "index.html").write_bytes(with_nav(daily[0].content, "archive/"))
     (OUT / "archive").mkdir()
-    (OUT / "archive" / "index.html").write_text(archive_page(reports), encoding="utf-8")
+    (OUT / "archive" / "index.html").write_text(archive_page(daily, weekly), encoding="utf-8")
 
-    print(f"完成：{len(reports)} 篇，最新 {reports[0].date}「{reports[0].title}」")
-    for r in reports:
-        print(f"  {r.date}  {r.name}")
+    print(f"完成：日報 {len(daily)} 篇（最新 {daily[0].date}「{daily[0].title}」），週報 {len(weekly)} 篇")
+    for r in daily:
+        print(f"  日報 {r.date}  {r.name}")
+    for r in weekly:
+        print(f"  週報 {r.date}  {r.name}")
 
 
 def main() -> None:
