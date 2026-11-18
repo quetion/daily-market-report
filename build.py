@@ -43,6 +43,20 @@ class Report:
     content: bytes
 
     @property
+    def premarket(self) -> bool:
+        return "盤前" in self.name
+
+    @property
+    def slug(self) -> str:
+        """網址：盤前另外加 -am，避免和同一天的盤後／分析互相覆蓋。"""
+        return self.date + ("-am" if self.premarket else "")
+
+    @property
+    def order(self) -> tuple:
+        """同一天裡盤前排在前面（較舊）。"""
+        return (self.date, 0 if self.premarket else 1)
+
+    @property
     def title(self) -> str:
         m = re.search(rb"<title[^>]*>(.*?)</title>", self.content, re.S | re.I)
         if m:
@@ -154,7 +168,7 @@ def rows_html(reports: list[Report], prefix: str) -> str:
     for r in reports:
         d = datetime.strptime(r.date, "%Y-%m-%d")
         rows.append(
-            f'<li><a href="../{prefix}{r.date}/"><span class="d">{d:%Y/%m/%d}（{WEEKDAYS[d.weekday()]}）</span>'
+            f'<li><a href="../{prefix}{r.slug}/"><span class="d">{d:%Y/%m/%d}（{WEEKDAYS[d.weekday()]}）</span>'
             f'<span class="t">{html.escape(r.title)}</span></a></li>'
         )
     return "<ul>\n" + "\n".join(rows) + "\n</ul>"
@@ -197,12 +211,12 @@ h2{{font-size:18px;margin:28px 0 10px}} h2 small{{color:var(--muted);font-weight
 
 
 def latest_per_date(reports: list[Report]) -> list[Report]:
-    """同一天取最後修改的那份，新到舊排序。"""
-    by_date: dict[str, Report] = {}
+    """同一個網址（日期，盤前另計）取最後修改的那份，新到舊排序。"""
+    by_slug: dict[str, Report] = {}
     for r in reports:
-        if r.date not in by_date or r.modified > by_date[r.date].modified:
-            by_date[r.date] = r
-    return sorted(by_date.values(), key=lambda r: r.date, reverse=True)
+        if r.slug not in by_slug or r.modified > by_slug[r.slug].modified:
+            by_slug[r.slug] = r
+    return sorted(by_slug.values(), key=lambda r: r.order, reverse=True)
 
 
 def build(src: dict[str, list[Report]]) -> None:
@@ -216,11 +230,11 @@ def build(src: dict[str, list[Report]]) -> None:
     (OUT / ".nojekyll").write_text("")
 
     for r in daily:
-        d = OUT / r.date
+        d = OUT / r.slug
         d.mkdir()
         (d / "index.html").write_bytes(with_nav(r.content, "../archive/"))
     for r in weekly:
-        d = OUT / "weekly" / r.date
+        d = OUT / "weekly" / r.slug
         d.mkdir(parents=True)
         (d / "index.html").write_bytes(with_nav(r.content, "../../archive/"))
     (OUT / "index.html").write_bytes(with_nav(daily[0].content, "archive/"))
@@ -229,7 +243,7 @@ def build(src: dict[str, list[Report]]) -> None:
 
     print(f"完成：日報 {len(daily)} 篇（最新 {daily[0].date}「{daily[0].title}」），週報 {len(weekly)} 篇")
     for r in daily:
-        print(f"  日報 {r.date}  {r.name}")
+        print(f"  日報 {r.slug}  {r.name}")
     for r in weekly:
         print(f"  週報 {r.date}  {r.name}")
 
